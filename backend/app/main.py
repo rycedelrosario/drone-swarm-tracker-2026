@@ -4,10 +4,13 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from app.vision import CentroidTracker, detect_blobs_otsu
 
+# 1. Initialize FastAPI app
 app = FastAPI(title="Drone Swarm Tracker API")
 
+# 2. Add CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
@@ -16,21 +19,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VIDEO_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../data/perdix_demo.mp4"))
+# 3. Define Paths
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+VIDEO_PATH = os.path.join(BASE_DIR, "data", "perdix_demo.mp4")
 
+# 4. HTTP Routes
 @app.get("/health")
 async def health_check():
     return {"ok": True, "video_exists": os.path.exists(VIDEO_PATH)}
 
+@app.get("/video")
+async def get_video():
+    if os.path.exists(VIDEO_PATH):
+        return FileResponse(VIDEO_PATH, media_type="video/mp4")
+    return {"error": "Video file not found"}
+
+# 5. WebSocket Route
 @app.websocket("/ws/tracks")
 async def websocket_tracks(websocket: WebSocket):
     await websocket.accept()
     
     cap = cv2.VideoCapture(VIDEO_PATH) if os.path.exists(VIDEO_PATH) else None
-    tracker = CentroidTracker(max_disappeared=10)
+    tracker = CentroidTracker(max_disappeared=30)
     
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap and cap.isOpened() else 1024
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap and cap.isOpened() else 576
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if (cap and cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_WIDTH) > 0) else 1024
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if (cap and cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_HEIGHT) > 0) else 576
 
     await websocket.send_json({
         "type": "hello",
@@ -74,8 +87,8 @@ async def websocket_tracks(websocket: WebSocket):
                             "confidence": 0.92,
                             "flags": []
                         })
-            
-            if not cap or not cap.isOpened() or len(tracks_payload) == 0:
+
+            if not cap or not cap.isOpened():
                 synthetic_angle = (synthetic_angle + 3.0) % 360.0
                 tracks_payload = [
                     {

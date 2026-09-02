@@ -78,7 +78,7 @@ def detect_blobs_otsu(frame):
     centroids = []
     for c in contours:
         area = cv2.contourArea(c)
-        if 8 < area < 1500:
+        if 2 < area < 2000:  # Lowered min area threshold to detect smaller targets
             M = cv2.moments(c)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
