@@ -1,0 +1,12 @@
+{
+    "camera": {
+      "latitude": 35.6895,
+      "longitude": -117.6908,
+      "height_m": 1200.0,
+      "vfov_deg": 40.0
+    },
+    "landmark": {
+      "pixel_y": 360,
+      "elevation_m": 850.0
+    }
+  }
