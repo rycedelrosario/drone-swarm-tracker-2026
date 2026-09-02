@@ -31,7 +31,8 @@ CONFIG_PATH = os.path.join(BASE_DIR, "data", "altitude_config.json")
 alt_config = load_altitude_config(CONFIG_PATH)
 
 # 2. Select detector via DETECTOR environment variable
-DETECTOR_TYPE = os.getenv("DETECTOR", "blob").lower()
+# Change this line in backend/app/main.py:
+DETECTOR_TYPE = os.getenv("DETECTOR", "yolo").lower()
 if DETECTOR_TYPE == "yolo":
     print("Initializing YOLOv8 Detector...")
     detector = YoloDetector(conf_thresh=0.12)
@@ -60,6 +61,15 @@ async def websocket_tracks(websocket: WebSocket):
     cap = cv2.VideoCapture(VIDEO_PATH) if os.path.exists(VIDEO_PATH) else None
     tracker = CentroidTracker(max_disappeared=30)
     
+    # Fast-forward past jet launch intro directly to active drone swarm sequence (~46s)
+    START_FRAME = 1400
+    # Ensure START_FRAME is within valid range
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if (cap and cap.isOpened()) else 0
+    START_FRAME = min(1400, max(0, total_frames - 30)) if total_frames > 0 else 0
+
+    if cap and cap.isOpened():
+        cap.set(cv2.CAP_PROP_POS_FRAMES, START_FRAME)
+        
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if (cap and cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_WIDTH) > 0) else 1024
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if (cap and cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_HEIGHT) > 0) else 576
 
@@ -77,7 +87,7 @@ async def websocket_tracks(websocket: WebSocket):
             if cap and cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, START_FRAME)
                     ret, frame = cap.read()
 
                 if ret:
@@ -86,6 +96,7 @@ async def websocket_tracks(websocket: WebSocket):
 
                     for obj_id, data in tracked_objects.items():
                         cx, cy = data["cx"], data["cy"]
+                        x1, y1, x2, y2 = data["bbox"]
                         heading = data["heading"]
                         rel_speed_u = data["rel_speed_u"]
 
@@ -95,6 +106,14 @@ async def websocket_tracks(websocket: WebSocket):
                         bearing = (round((cv2.fastAtan2(norm_x, -norm_y)), 1)) % 360.0
                         range_u = min(0.95, max(0.08, round(float(np.hypot(norm_x, norm_y)), 2)))
                         alt_m = estimate_altitude(cy, frame_h, alt_config)
+
+                        # Real normalized bounding box coordinates (0.0 to 1.0)
+                        norm_box = [
+                            max(0.0, float(x1) / frame_w),
+                            max(0.0, float(y1) / frame_h),
+                            min(1.0, float(x2) / frame_w),
+                            min(1.0, float(y2) / frame_h)
+                        ]
 
                         tracks_payload.append({
                             "id": obj_id,
@@ -107,7 +126,8 @@ async def websocket_tracks(websocket: WebSocket):
                             "alt_band": "LOW" if range_u < 0.35 else "MED" if range_u < 0.7 else "HIGH",
                             "altitude_m": alt_m,
                             "confidence": 0.92,
-                            "flags": []
+                            "flags": [],
+                            "bbox": norm_box
                         })
 
             await websocket.send_json({
