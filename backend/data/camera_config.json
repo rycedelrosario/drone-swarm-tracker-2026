@@ -1,0 +1,14 @@
+{
+  "_note": "China Lake NAWS approx coords; camera_height_m is a rough chase-plane altitude guess, not measured",
+  "lat": 35.6858,
+  "lon": -117.6832,
+  "camera_height_m": 3000,
+  "vertical_fov_deg": 35.98,
+  "reference_points": [
+    {
+      "name": "horizon",
+      "pixel_y": 400,
+      "elevation_m": 3000
+    }
+  ]
+}
