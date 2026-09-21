@@ -15,6 +15,24 @@ CREATE TABLE IF NOT EXISTS track_samples (
     confidence REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_track_samples_ts_ms ON track_samples (ts_ms);
+
+CREATE TABLE IF NOT EXISTS zones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('rect', 'polygon')),
+    geometry TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms INTEGER NOT NULL,
+    zone_id INTEGER NOT NULL REFERENCES zones(id),
+    track_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts_ms ON events (ts_ms);
+CREATE INDEX IF NOT EXISTS idx_events_zone_id ON events (zone_id);
 """
 
 

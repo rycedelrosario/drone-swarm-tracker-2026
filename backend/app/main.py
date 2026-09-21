@@ -1,28 +1,35 @@
 import asyncio
+import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 
 import cv2
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from starlette.responses import FileResponse
 
 from app.altitude import altitude_m as compute_altitude_m
 from app.altitude import load_camera_config
 from app.blob_detector import BlobDetector
 from app.db import get_db
-from app.radar import pixel_to_radar
+from app.radar import bearing_range_to_unit_xy, pixel_to_radar
 from app.track_writer import TrackSampleWriter
 from app.tracker import MultiObjectTracker
+from app.zone_events import ZoneEventEngine
 
 VIDEO_PATH = Path(__file__).resolve().parent.parent / "data" / "perdix_swarm_demo.mp4"
 HEADING_SPEED_NORM = 10.0
 RANGE_MAX_M = 5000.0  # rough max visible ground range in this clip's clear desert air
 SAMPLE_INTERVAL_S = 0.1  # ~10Hz persistence, decoupled from the video's ~30fps frame rate
+ZONE_REFRESH_INTERVAL_S = 5.0  # how often a connection re-reads /zones for newly drawn ones
 REPLAY_MAX_RANGE_MS = 10 * 60 * 1000
 REPLAY_MAX_LIMIT = 20000
+SQLITE_MAX_INTEGER = 9223372036854775807  # 64-bit signed max; larger values overflow SQLite's INTEGER
 
 CAMERA_CONFIG = load_camera_config()
 CAMERA_HEIGHT_M = CAMERA_CONFIG["camera_height_m"]
@@ -62,8 +69,8 @@ async def video():
 
 @app.get("/replay")
 async def replay(
-    start_ms: int = Query(...),
-    end_ms: int = Query(...),
+    start_ms: int = Query(..., ge=0, le=SQLITE_MAX_INTEGER),
+    end_ms: int = Query(..., ge=0, le=SQLITE_MAX_INTEGER),
     limit: int = Query(1000, ge=1, le=REPLAY_MAX_LIMIT),
 ):
     if start_ms >= end_ms:
@@ -79,6 +86,148 @@ async def replay(
 
     columns = ["ts_ms", "track_id", "bearing", "range_u", "heading", "rel_speed_u", "altitude_m", "confidence"]
     return {"rows": [dict(zip(columns, row)) for row in rows]}
+
+
+@app.get("/events")
+async def get_events(
+    start_ms: int = Query(..., ge=0, le=SQLITE_MAX_INTEGER),
+    end_ms: int = Query(..., ge=0, le=SQLITE_MAX_INTEGER),
+    limit: int = Query(1000, ge=1, le=REPLAY_MAX_LIMIT),
+):
+    if start_ms >= end_ms:
+        raise HTTPException(400, "start_ms must be less than end_ms")
+    if end_ms - start_ms > REPLAY_MAX_RANGE_MS:
+        raise HTTPException(400, f"range must not exceed {REPLAY_MAX_RANGE_MS} ms (10 minutes)")
+
+    rows = read_conn.execute(
+        "SELECT events.ts_ms, events.track_id, events.zone_id, events.event_type, zones.name "
+        "FROM events LEFT JOIN zones ON zones.id = events.zone_id "
+        "WHERE events.ts_ms >= ? AND events.ts_ms <= ? ORDER BY events.ts_ms LIMIT ?",
+        (start_ms, end_ms, limit),
+    ).fetchall()
+
+    return {
+        "events": [
+            {
+                "ts_ms": ts_ms,
+                "track_id": track_id,
+                "callsign": f"UAV-{track_id:02d}",
+                "zone_id": zone_id,
+                "zone_name": zone_name or "?",
+                "type": event_type,
+            }
+            for ts_ms, track_id, zone_id, event_type, zone_name in rows
+        ]
+    }
+
+
+MAX_ZONE_NAME_LEN = 128
+MAX_POLYGON_VERTICES = 256
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class ZoneCreate(BaseModel):
+    name: str
+    kind: str
+    geometry: dict
+
+
+def sanitize_zone_name(name):
+    return CONTROL_CHARS_RE.sub("", name).strip()
+
+
+def _in_unit_range(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0
+
+
+def validate_geometry(kind, geometry):
+    if kind == "rect":
+        if set(geometry.keys()) != {"x1", "y1", "x2", "y2"}:
+            raise HTTPException(400, "rect geometry must have exactly x1, y1, x2, y2")
+        x1, y1, x2, y2 = geometry["x1"], geometry["y1"], geometry["x2"], geometry["y2"]
+        if not all(_in_unit_range(v) for v in (x1, y1, x2, y2)):
+            raise HTTPException(400, "rect coordinates must be numbers in [0, 1]")
+        if x1 >= x2 or y1 >= y2:
+            raise HTTPException(400, "rect requires x1 < x2 and y1 < y2")
+    elif kind == "polygon":
+        points = geometry.get("points")
+        if not isinstance(points, list) or len(points) < 3:
+            raise HTTPException(400, "polygon requires a points list with at least 3 points")
+        if len(points) > MAX_POLYGON_VERTICES:
+            raise HTTPException(400, f"polygon must have at most {MAX_POLYGON_VERTICES} vertices")
+        for p in points:
+            if not (isinstance(p, list) and len(p) == 2 and all(_in_unit_range(v) for v in p)):
+                raise HTTPException(400, "each polygon point must be [x, y] with x, y in [0, 1]")
+    else:
+        raise HTTPException(400, "kind must be 'rect' or 'polygon'")
+
+
+def zone_row_to_dict(row):
+    zone_id, name, kind, geometry, created_ms = row
+    return {"id": zone_id, "name": name, "kind": kind, "geometry": json.loads(geometry), "created_ms": created_ms}
+
+
+def load_zones():
+    rows = read_conn.execute("SELECT id, name, kind, geometry, created_ms FROM zones ORDER BY id").fetchall()
+    return [zone_row_to_dict(row) for row in rows]
+
+
+def persist_and_enrich_events(events, zones_by_id, tracks_by_id):
+    if not events:
+        return []
+    read_conn.executemany(
+        "INSERT INTO events (ts_ms, zone_id, track_id, event_type) VALUES (?, ?, ?, ?)",
+        [(e["ts_ms"], e["zone_id"], e["track_id"], e["type"]) for e in events],
+    )
+    read_conn.commit()
+    return [
+        {
+            "type": e["type"],
+            "ts_ms": e["ts_ms"],
+            "track_id": e["track_id"],
+            "callsign": tracks_by_id.get(e["track_id"], {}).get("callsign", f"UAV-{e['track_id']:02d}"),
+            "zone_id": e["zone_id"],
+            "zone_name": zones_by_id.get(e["zone_id"], {}).get("name", "?"),
+        }
+        for e in events
+    ]
+
+
+@app.get("/zones")
+async def list_zones():
+    rows = read_conn.execute("SELECT id, name, kind, geometry, created_ms FROM zones ORDER BY id").fetchall()
+    return {"zones": [zone_row_to_dict(row) for row in rows]}
+
+
+@app.post("/zones")
+async def create_zone(zone: ZoneCreate):
+    name = sanitize_zone_name(zone.name)
+    if not name:
+        raise HTTPException(400, "name is required")
+    if len(name) > MAX_ZONE_NAME_LEN:
+        raise HTTPException(400, f"name must be at most {MAX_ZONE_NAME_LEN} characters")
+    validate_geometry(zone.kind, zone.geometry)
+
+    created_ms = int(time.time() * 1000)
+    cur = read_conn.execute(
+        "INSERT INTO zones (name, kind, geometry, created_ms) VALUES (?, ?, ?, ?)",
+        (name, zone.kind, json.dumps(zone.geometry), created_ms),
+    )
+    read_conn.commit()
+
+    row = read_conn.execute(
+        "SELECT id, name, kind, geometry, created_ms FROM zones WHERE id = ?", (cur.lastrowid,)
+    ).fetchone()
+    return zone_row_to_dict(row)
+
+
+@app.delete("/zones/{zone_id}")
+async def delete_zone(zone_id: int = PathParam(..., ge=1, le=SQLITE_MAX_INTEGER)):
+    cur = read_conn.execute("DELETE FROM zones WHERE id = ?", (zone_id,))
+    read_conn.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(404, "zone not found")
+    return {"deleted": zone_id}
 
 
 def alt_band_for(range_u):
@@ -141,6 +290,10 @@ async def ws_tracks(websocket: WebSocket):
     frame_interval = 1.0 / fps
     frame_idx = 0
     last_sample_t = 0.0
+    last_zone_refresh_t = 0.0
+
+    zones = load_zones()
+    zone_engine = ZoneEventEngine(zones)
 
     try:
         while True:
@@ -171,6 +324,22 @@ async def ws_tracks(websocket: WebSocket):
                         "confidence": p["confidence"],
                     })
 
+                if now - last_zone_refresh_t >= ZONE_REFRESH_INTERVAL_S:
+                    last_zone_refresh_t = now
+                    zones = load_zones()
+                    zone_engine.set_zones(zones)
+
+                zones_by_id = {z["id"]: z for z in zones}
+                tracks_by_id = {p["id"]: p for p in payload}
+                raw_events = []
+                for p in payload:
+                    x, y = bearing_range_to_unit_xy(p["bearing"], p["range_u"])
+                    raw_events.extend(zone_engine.process(p["id"], x, y, ts_ms))
+
+                zone_events = persist_and_enrich_events(raw_events, zones_by_id, tracks_by_id)
+                if zone_events:
+                    await websocket.send_json({"type": "events", "events": zone_events})
+
             await websocket.send_json({
                 "type": "tracks_snapshot",
                 "media_t_sec": round(frame_idx / fps, 3),
@@ -188,8 +357,8 @@ async def ws_tracks(websocket: WebSocket):
 @app.websocket("/ws/replay")
 async def ws_replay(
     websocket: WebSocket,
-    start_ms: int = Query(...),
-    end_ms: int = Query(...),
+    start_ms: int = Query(..., ge=0, le=SQLITE_MAX_INTEGER),
+    end_ms: int = Query(..., ge=0, le=SQLITE_MAX_INTEGER),
     rate: float = Query(1.0, gt=0),
     hz: float = Query(10.0, gt=0),
 ):
